@@ -4,6 +4,7 @@ import gc
 import inspect
 import io
 import os
+import re
 from dataclasses import dataclass
 from functools import wraps
 
@@ -32,6 +33,10 @@ class AnyType(str):
 
 
 any_type = AnyType("*")
+
+默认图片提示词 = ""
+默认图片系统提示词 = "描述这张图,300字左右."
+默认文本系统提示词 = "描述这张图,300字左右."
 
 
 def _确保_llm目录已注册() -> None:
@@ -69,8 +74,7 @@ def _列出llm文件() -> list[str]:
 
 def _图片转base64(image_tensor) -> str:
     """
-    ComfyUI 的 IMAGE 是 float32 0..1，shape 通常为 [B,H,W,C]。
-    这里取第 1 张，并编码为 JPEG base64。
+    编码为 JPEG base64。
     """
     if image_tensor is None:
         return ""
@@ -133,6 +137,70 @@ def _调用chat_completion(llm, *, messages, params: dict) -> dict:
         kwargs = {k: v for k, v in kwargs.items() if k in allowed}
 
     return llm.create_chat_completion(**kwargs)
+
+
+def _清洗think块文本(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return "" if text is None else str(text)
+
+    cleaned = text
+    cleaned = re.sub(r"<think\b[^>]*>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+    if re.search(r"</think>", cleaned, flags=re.IGNORECASE):
+        cleaned = re.sub(r"^.*?</think>\s*", "", cleaned, count=1, flags=re.DOTALL | re.IGNORECASE)
+
+    cleaned = cleaned.replace("<think>", "").replace("</think>", "")
+    return cleaned
+
+
+def _规范化随机种子(seed_value):
+    try:
+        seed_value = int(seed_value)
+    except Exception:
+        return None
+
+    if seed_value < 0:
+        return None
+    return seed_value
+
+
+def _重置llm推理状态(llm) -> None:
+    try:
+        ctx = getattr(llm, "_ctx", None)
+        if ctx is not None and hasattr(ctx, "memory_clear"):
+            ctx.memory_clear(True)
+    except Exception:
+        pass
+
+    try:
+        hybrid_cache_mgr = getattr(llm, "_hybrid_cache_mgr", None)
+        if hybrid_cache_mgr is not None and hasattr(hybrid_cache_mgr, "clear"):
+            hybrid_cache_mgr.clear()
+    except Exception:
+        pass
+
+    try:
+        batch = getattr(llm, "_batch", None)
+        if batch is not None and hasattr(batch, "reset"):
+            batch.reset()
+    except Exception:
+        pass
+
+    try:
+        input_ids = getattr(llm, "input_ids", None)
+        if input_ids is not None and hasattr(input_ids, "fill"):
+            input_ids.fill(0)
+    except Exception:
+        pass
+
+    try:
+        reset = getattr(llm, "reset", None)
+        if callable(reset):
+            reset()
+        elif hasattr(llm, "n_tokens"):
+            llm.n_tokens = 0
+    except Exception:
+        pass
 
 
 @dataclass
@@ -211,13 +279,22 @@ class _QwenStorage:
 
         n_ctx = int(config.get("n_ctx", 8192))
         n_gpu_layers = int(config.get("n_gpu_layers", -1))
-        llm = Llama(
-            model_path=model_path,
-            chat_handler=chat_handler,
-            n_ctx=n_ctx,
-            n_gpu_layers=n_gpu_layers,
-            verbose=False,
-        )
+
+        llama_kwargs = {
+            "model_path": model_path,
+            "chat_handler": chat_handler,
+            "n_ctx": n_ctx,
+            "n_gpu_layers": n_gpu_layers,
+            "ctx_checkpoints": 0,
+            "verbose": False,
+        }
+
+        if mmproj_path:
+            vision_batch = max(2048, n_ctx)
+            llama_kwargs["n_batch"] = vision_batch
+            llama_kwargs["n_ubatch"] = vision_batch
+
+        llm = Llama(**llama_kwargs)
 
         cls.model = _QwenModel(llm=llm, settings=dict(config), chat_handler=chat_handler)
         return cls.model
@@ -271,7 +348,7 @@ class QwenTE模型加载器:
                 "模型系列": (["Qwen3-VL", "Qwen3.5-VL"], {"default": "Qwen3.5-VL"}),
                 "主模型": (model_list, {"tooltip": "主模型文件（建议 .gguf）放到 ComfyUI/models/LLM/"}),
                 "视觉投影mmproj": (mmproj_list, {"default": "无", "tooltip": "多模态需要 mmproj；纯文本可选“无”。"}),
-                "启用思考": ("BOOLEAN", {"default": True, "tooltip": "Qwen3.5: enable_thinking；Qwen3: force_reasoning/use_think_prompt（取决于版本）。"}),
+                "启用思考": ("BOOLEAN", {"default": False, "tooltip": "Qwen3.5: enable_thinking；Qwen3: force_reasoning/use_think_prompt（取决于版本）。"}),
                 "上下文长度": ("INT", {"default": 8192, "min": 1024, "max": 327680, "step": 256, "tooltip": "对应 llama.cpp 的 n_ctx。"}),
                 "GPU层数": ("INT", {"default": -1, "min": -1, "max": 9999, "step": 1, "tooltip": "对应 llama.cpp 的 n_gpu_layers；-1=尽可能多上GPU；0=纯CPU。"}),
             }
@@ -304,19 +381,20 @@ class QwenTE图像推理:
         return {
             "required": {
                 "qwen模型": ("QWENLLAMA",),
-                "输入模式": (["图片", "逐帧", "视频"], {"default": "图片", "tooltip": "图片=只读第1张；逐帧=一张一张推理；视频=抽帧后一次性推理。"}),
-                "提示词": ("STRING", {"default": "请描述这张图片。", "multiline": True}),
-                "系统提示词": ("STRING", {"default": "你是一个图片描绘师,用中文输出,不要输出除了图片描绘的内容。", "multiline": True}),
+                "输入模式": (["图片", "逐帧", "视频", "文本"], {"default": "图片", "tooltip": "图片=只读第1张；逐帧=一张一张推理；视频=抽帧后一次性推理；文本=仅文字输入，无需图片。"}),
+                "提示词": ("STRING", {"default": 默认图片提示词, "multiline": True}),
+                "系统提示词": ("STRING", {"default": 默认图片系统提示词, "multiline": True}),
                 "最多帧数": ("INT", {"default": 24, "min": 2, "max": 1024, "step": 1, "tooltip": "视频模式下从输入图片序列中均匀抽取的帧数。"}),
                 "最大边长": ("INT", {"default": 512, "min": 128, "max": 16384, "step": 64, "tooltip": "对输入图片做缩放以提速（取最长边）。"}),
-                "最大生成token": ("INT", {"default": 4096, "min": 1, "max": 8192, "step": 1}),
+                "最大生成token": ("INT", {"default": 1024, "min": 20, "max": 8192, "step": 1}),
                 "温度": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "top_k": ("INT", {"default": 20, "min": 0, "max": 200, "step": 1}),
                 "重复惩罚": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.01}),
                 "频率惩罚": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "存在惩罚": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "随机种子": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1, "control_after_generate": True, "tooltip": "随机种子。可用 ComfyUI 的生成后控制来固定、递增、递减或随机。"}),
+                "输出think块": ("BOOLEAN", {"default": True, "tooltip": "开启=保留模型原始 `<think>...</think>` 输出；关闭=仅在最终结果里移除 think 块。"}),
             },
             "optional": {
                 "图片": ("IMAGE",),
@@ -343,7 +421,8 @@ class QwenTE图像推理:
         重复惩罚,
         频率惩罚,
         存在惩罚,
-        随机种子,
+        seed,
+        输出think块,
         图片=None,
     ):
         # 卸载后 / 引用失效时：自动重载与同步到当前有效模型
@@ -369,8 +448,13 @@ class QwenTE图像推理:
 
         messages = []
         system_text = (系统提示词 or "").strip()
-        if 输入模式 == "视频" and system_text:
+
+        if 输入模式 == "文本":
+            if not system_text or system_text == 默认图片系统提示词:
+                system_text = 默认文本系统提示词
+        elif 输入模式 == "视频" and system_text:
             system_text = "请将输入的图片序列当做视频而不是静态帧序列, " + system_text
+
         if system_text:
             messages.append({"role": "system", "content": system_text})
 
@@ -382,12 +466,16 @@ class QwenTE图像推理:
             frame_indices = [0]
         elif 输入模式 == "逐帧":
             frame_indices = list(range(total_images))
-        else:  # 视频
+        elif 输入模式 == "视频":
             if total_images == 1:
                 frame_indices = [0]
             else:
                 count = min(max(int(最多帧数), 2), total_images)
                 frame_indices = np.linspace(0, total_images - 1, count, dtype=int).tolist()
+        elif 输入模式 == "文本":
+            frame_indices = []
+        else:
+            raise ValueError(f"未知输入模式：{输入模式}")
 
         params = {
             "max_tokens": int(最大生成token),
@@ -397,13 +485,24 @@ class QwenTE图像推理:
             "repeat_penalty": float(重复惩罚),
             "frequency_penalty": float(频率惩罚),
             "presence_penalty": float(存在惩罚),
-            "seed": int(随机种子),
+            "seed": _规范化随机种子(seed),
             "stream": False,
             "stop": ["</s>"],
         }
 
         prompt_text = (提示词 or "").strip()
-        if 输入模式 == "逐帧":
+        if 输入模式 == "文本":
+            if not prompt_text:
+                raise ValueError("文本模式下，提示词不能为空。")
+
+            messages.append({"role": "user", "content": prompt_text})
+            _重置llm推理状态(llm)
+            out = _调用chat_completion(llm, messages=messages, params=params)
+            try:
+                text = out["choices"][0]["message"]["content"]
+            except Exception:
+                text = str(out)
+        elif 输入模式 == "逐帧":
             user_content = [{"type": "text", "text": prompt_text}, {"type": "image_url", "image_url": {"url": ""}}]
             messages.append({"role": "user", "content": user_content})
 
@@ -415,6 +514,7 @@ class QwenTE图像推理:
                 if not img_b64:
                     continue
                 user_content[1]["image_url"]["url"] = f"data:image/jpeg;base64,{img_b64}"
+                _重置llm推理状态(llm)
                 out = _调用chat_completion(llm, messages=messages, params=params)
                 try:
                     part = out["choices"][0]["message"]["content"]
@@ -433,11 +533,15 @@ class QwenTE图像推理:
                     continue
                 user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
             messages.append({"role": "user", "content": user_content})
+            _重置llm推理状态(llm)
             out = _调用chat_completion(llm, messages=messages, params=params)
             try:
                 text = out["choices"][0]["message"]["content"]
             except Exception:
                 text = str(out)
+
+        if not bool(输出think块):
+            text = _清洗think块文本(text)
 
         if mm.processing_interrupted():
             raise mm.InterruptProcessingException()

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ComfyUI  Qwen3/Qwen3.5 (llama-cpp-python) 插件
+ComfyUI  Qwen3/Qwen3.5 llama TE 插件
 """
 
 from .nodes import (
